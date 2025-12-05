@@ -1,0 +1,21 @@
+{
+  "name": "safeway-category",
+  "version": "1.0.0",
+  "description": "Fetch Safeway category data using distributed GitHub Actions",
+  "main": "fetch-category.js",
+  "scripts": {
+    "start": "node fetch-category.js",
+    "test": "node fetch-category.js 00000000 000000ff 10"
+  },
+  "keywords": [
+    "safeway",
+    "category",
+    "scraper"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.2"
+  }
+}
+

@@ -1,0 +1,563 @@
+name: Fetch Category Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_hex:
+        description: '起始 Hash (例如: 00000000)'
+        required: true
+        default: '00000000'
+      end_hex:
+        description: '结束 Hash (例如: ffffffff)'
+        required: true
+        default: '00000fff'
+      splits:
+        description: '分割成几个并行任务'
+        required: true
+        default: '10'
+      concurrency:
+        description: '每个任务的并发数'
+        required: true
+        default: '50'
+
+jobs:
+  calculate-ranges:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      job_count: ${{ steps.split.outputs.job_count }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Calculate hash ranges
+        id: split
+        run: |
+          node << 'EOF'
+          const startHex = process.env.START_HEX;
+          const endHex = process.env.END_HEX;
+          const splits = parseInt(process.env.SPLITS);
+
+          const start = parseInt(startHex, 16);
+          const end = parseInt(endHex, 16);
+          const total = end - start + 1;
+          const chunkSize = Math.ceil(total / splits);
+
+          const ranges = [];
+          for (let i = 0; i < splits; i++) {
+            const rangeStart = start + i * chunkSize;
+            const rangeEnd = Math.min(start + (i + 1) * chunkSize - 1, end);
+            
+            if (rangeStart <= end) {
+              ranges.push({
+                id: i + 1,
+                start: rangeStart.toString(16).padStart(8, '0'),
+                end: rangeEnd.toString(16).padStart(8, '0')
+              });
+            }
+          }
+
+          console.log('Generated ranges:', JSON.stringify(ranges, null, 2));
+          
+          // 输出到 GitHub Actions
+          const fs = require('fs');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(ranges)}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `job_count=${ranges.length}\n`);
+          EOF
+        env:
+          START_HEX: ${{ github.event.inputs.start_hex }}
+          END_HEX: ${{ github.event.inputs.end_hex }}
+          SPLITS: ${{ github.event.inputs.splits }}
+
+  fetch-data:
+    needs: calculate-ranges
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 10  # 最多同时运行10个任务
+      fail-fast: false   # 一个任务失败不影响其他任务
+      matrix:
+        range: ${{ fromJson(needs.calculate-ranges.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then
+            npm install
+          else
+            npm install axios
+          fi
+
+      - name: Fetch category data
+        run: |
+          echo "🚀 Processing range: ${{ matrix.range.start }} to ${{ matrix.range.end }}"
+          echo "⏰ Max runtime: 5.8 hours (leaving buffer before 6h limit)"
+          echo "========================================"
+          
+          # 启动后台进度监控
+          (
+            sleep 60  # 等待1分钟后开始监控
+            while true; do
+              if [ -f output/progress.json ]; then
+                echo ""
+                echo "╔═══════════════════ PROGRESS UPDATE ═══════════════════╗"
+                echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+                
+                # 提取关键信息
+                LAST_HEX=$(grep -o '"lastProcessedHex":"[^"]*"' output/progress.json | cut -d'"' -f4)
+                PROCESSED=$(grep -o '"processedCount":[0-9]*' output/progress.json | grep -o '[0-9]*')
+                FOUND=$(grep -o '"foundCount":[0-9]*' output/progress.json | grep -o '[0-9]*')
+                RATE=$(grep -o '"avgRate":"[^"]*"' output/progress.json | cut -d'"' -f4)
+                ELAPSED=$(grep -o '"elapsedSeconds":[0-9]*' output/progress.json | grep -o '[0-9]*')
+                
+                echo "├─ Last Processed: $LAST_HEX"
+                echo "├─ Total Processed: $PROCESSED"
+                echo "├─ Widgets Found: $FOUND"
+                echo "├─ Average Rate: $RATE req/s"
+                echo "├─ Elapsed Time: $((ELAPSED/3600))h $((ELAPSED%3600/60))m $((ELAPSED%60))s"
+                
+                # 显示找到的 widgets
+                if [ ! -z "$FOUND" ] && [ "$FOUND" -gt "0" ]; then
+                  echo "├─ Found Widgets:"
+                  grep -o '"GR-C-Categ-[^"]*"' output/progress.json | tr -d '"' | head -10 | while read widget; do
+                    echo "│  • $widget"
+                  done
+                  if [ "$FOUND" -gt "10" ]; then
+                    echo "│  ... and $((FOUND-10)) more"
+                  fi
+                fi
+                echo "╚══════════════════════════════════════════════════════╝"
+                echo ""
+              fi
+              sleep 300  # 每5分钟输出一次
+            done
+          ) &
+          MONITOR_PID=$!
+          
+          # 运行主任务
+          MAX_RUNTIME_SECONDS=20880 node fetch-category.js ${{ matrix.range.start }} ${{ matrix.range.end }} ${{ github.event.inputs.concurrency }}
+          EXIT_CODE=$?
+          
+          # 停止监控
+          kill $MONITOR_PID 2>/dev/null || true
+          
+          echo ""
+          echo "========================================"
+          echo "Task completed with exit code: $EXIT_CODE"
+          
+          exit $EXIT_CODE
+        continue-on-error: true
+        timeout-minutes: 350  # 5.8 小时
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: category-data-part-${{ matrix.range.id }}
+          path: output/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Display Summary
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════"
+          echo "           TASK ${{ matrix.range.id }} FINAL REPORT"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          
+          # 显示 summary.txt 内容
+          if [ -f output/summary.txt ]; then
+            cat output/summary.txt
+            echo ""
+          fi
+          
+          # 生成 GitHub Step Summary
+          echo "### 📊 Task ${{ matrix.range.id }} - Final Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Range:** \`${{ matrix.range.start }}\` → \`${{ matrix.range.end }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 提取关键统计信息
+          if [ -f output/progress.json ]; then
+            PROCESSED=$(grep -o '"processedCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            FOUND=$(grep -o '"foundCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            RATE=$(grep -o '"avgRate":"[^"]*"' output/progress.json | cut -d'"' -f4 || echo "0")
+            ELAPSED=$(grep -o '"elapsedSeconds":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            LAST_HEX=$(grep -o '"lastProcessedHex":"[^"]*"' output/progress.json | cut -d'"' -f4 || echo "unknown")
+            
+            # 创建统计表格
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 📍 Last Processed | \`${LAST_HEX}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📊 Total Processed | **${PROCESSED}** |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Widgets Found | **${FOUND}** |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚡ Average Rate | ${RATE} req/s |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏱️ Runtime | $((ELAPSED/3600))h $((ELAPSED%3600/60))m $((ELAPSED%60))s |" >> $GITHUB_STEP_SUMMARY
+            
+            # 计算成功率
+            if [ "$PROCESSED" -gt "0" ]; then
+              SUCCESS_RATE=$(awk "BEGIN {printf \"%.4f\", ($FOUND / $PROCESSED) * 100}")
+              echo "| 🎯 Success Rate | ${SUCCESS_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # 进度可视化
+            START_DEC=$((16#${{ matrix.range.start }}))
+            END_DEC=$((16#${{ matrix.range.end }}))
+            LAST_DEC=$((16#${LAST_HEX}))
+            RANGE_TOTAL=$((END_DEC - START_DEC + 1))
+            RANGE_DONE=$((LAST_DEC - START_DEC + 1))
+            PROGRESS_PCT=$(awk "BEGIN {printf \"%.1f\", ($RANGE_DONE / $RANGE_TOTAL) * 100}")
+            
+            echo "#### 📈 Progress" >> $GITHUB_STEP_SUMMARY
+            echo "- Completed: **${PROGRESS_PCT}%** of assigned range" >> $GITHUB_STEP_SUMMARY
+            echo "- Total IDs in range: ${RANGE_TOTAL}" >> $GITHUB_STEP_SUMMARY
+            echo "- IDs processed: ${RANGE_DONE}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # 显示找到的 widgets
+            if [ "$FOUND" -gt "0" ]; then
+              echo "#### ✅ Found Widgets (${FOUND})" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              grep -o '"GR-C-Categ-[^"]*"' output/progress.json | tr -d '"' | nl -w2 -s'. ' >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "#### ℹ️ No Widgets Found" >> $GITHUB_STEP_SUMMARY
+              echo "This range did not contain any valid category widgets." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # 文件列表
+          JSON_COUNT=$(find output -name "GR-C-Categ-*.json" 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$JSON_COUNT" -gt "0" ]; then
+            echo "#### 📁 Generated Files (${JSON_COUNT})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>Click to view file list</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            find output -name "GR-C-Categ-*.json" | sort | head -50 >> $GITHUB_STEP_SUMMARY
+            if [ "$JSON_COUNT" -gt "50" ]; then
+              echo "... and $((JSON_COUNT - 50)) more files" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 详细报告（折叠）
+          if [ -f output/summary.txt ]; then
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>📄 Detailed Report</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat output/summary.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  merge-results:
+    needs: fetch-data
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results/
+          pattern: category-data-part-*
+          merge-multiple: true
+
+      - name: Generate overall summary
+        run: |
+          echo "════════════════════════════════════════════════════════"
+          echo "           GENERATING COMPLETE SUMMARY"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          
+          # 统计所有任务
+          TOTAL_FILES=$(find all-results -name "GR-C-Categ-*.json" 2>/dev/null | wc -l | tr -d ' ')
+          echo "📁 Total widget files: $TOTAL_FILES"
+          
+          # 汇总所有 progress.json
+          echo "📊 Analyzing all task results..."
+          
+          TOTAL_PROCESSED=0
+          TOTAL_FOUND=0
+          TOTAL_ELAPSED=0
+          
+          # 创建临时文件存储统计
+          > task_stats.txt
+          
+          for progress_file in $(find all-results -name "progress.json"); do
+            if [ -f "$progress_file" ]; then
+              PROCESSED=$(grep -o '"processedCount":[0-9]*' "$progress_file" | grep -o '[0-9]*' || echo "0")
+              FOUND=$(grep -o '"foundCount":[0-9]*' "$progress_file" | grep -o '[0-9]*' || echo "0")
+              ELAPSED=$(grep -o '"elapsedSeconds":[0-9]*' "$progress_file" | grep -o '[0-9]*' || echo "0")
+              RANGE_START=$(grep -o '"startHex":"[^"]*"' "$progress_file" | cut -d'"' -f4 || echo "?")
+              RANGE_END=$(grep -o '"endHex":"[^"]*"' "$progress_file" | cut -d'"' -f4 || echo "?")
+              LAST_HEX=$(grep -o '"lastProcessedHex":"[^"]*"' "$progress_file" | cut -d'"' -f4 || echo "?")
+              
+              TOTAL_PROCESSED=$((TOTAL_PROCESSED + PROCESSED))
+              TOTAL_FOUND=$((TOTAL_FOUND + FOUND))
+              if [ "$ELAPSED" -gt "$TOTAL_ELAPSED" ]; then
+                TOTAL_ELAPSED=$ELAPSED
+              fi
+              
+              echo "${RANGE_START}|${RANGE_END}|${LAST_HEX}|${PROCESSED}|${FOUND}|${ELAPSED}" >> task_stats.txt
+            fi
+          done
+          
+          echo ""
+          echo "═══════════════ OVERALL STATISTICS ═══════════════"
+          echo "Total Processed: $(printf "%'d" $TOTAL_PROCESSED)"
+          echo "Total Found: $TOTAL_FOUND widgets"
+          echo "Longest Runtime: $((TOTAL_ELAPSED/3600))h $((TOTAL_ELAPSED%3600/60))m $((TOTAL_ELAPSED%60))s"
+          
+          if [ "$TOTAL_PROCESSED" -gt "0" ]; then
+            SUCCESS_RATE=$(awk "BEGIN {printf \"%.6f\", ($TOTAL_FOUND / $TOTAL_PROCESSED) * 100}")
+            echo "Success Rate: $SUCCESS_RATE%"
+            AVG_RATE=$(awk "BEGIN {printf \"%.2f\", $TOTAL_PROCESSED / $TOTAL_ELAPSED}")
+            echo "Average Rate: $AVG_RATE req/s"
+          fi
+          echo ""
+
+      - name: Aggregate all widgets
+        run: |
+          # 汇总所有成功的 widgets
+          echo "Aggregating all successful widgets..."
+          
+          # 收集所有 progress.json 中的成功 widgets
+          find all-results -name "progress.json" -exec cat {} \; | \
+            grep -o '"GR-C-Categ-[^"]*"' | \
+            tr -d '"' | \
+            sort -u > all-successful-widgets.txt
+          
+          TOTAL_WIDGETS=$(wc -l < all-successful-widgets.txt | tr -d ' ')
+          echo "✅ Total unique widgets found: $TOTAL_WIDGETS"
+          echo ""
+          
+          if [ "$TOTAL_WIDGETS" -gt "0" ]; then
+            echo "Widget List:"
+            cat all-successful-widgets.txt | nl -w3 -s'. '
+          fi
+          echo ""
+          
+      - name: Create detailed report
+        run: |
+          # 创建详细汇总报告
+          cat > final-report.txt << 'REPORT_END'
+╔════════════════════════════════════════════════════════╗
+║         COMPLETE SCAN SUMMARY REPORT                   ║
+╚════════════════════════════════════════════════════════╝
+REPORT_END
+          
+          echo "" >> final-report.txt
+          echo "📊 Overall Statistics:" >> final-report.txt
+          echo "   Configuration: ${{ github.event.inputs.start_hex }} → ${{ github.event.inputs.end_hex }}" >> final-report.txt
+          echo "   Parallel tasks: ${{ github.event.inputs.splits }}" >> final-report.txt
+          echo "   Concurrency per task: ${{ github.event.inputs.concurrency }}" >> final-report.txt
+          echo "" >> final-report.txt
+          
+          # 从之前的统计读取
+          if [ -f task_stats.txt ]; then
+            TASK_COUNT=$(wc -l < task_stats.txt | tr -d ' ')
+            TOTAL_PROCESSED=$(awk -F'|' '{sum+=$4} END {print sum}' task_stats.txt)
+            TOTAL_FOUND=$(awk -F'|' '{sum+=$5} END {print sum}' task_stats.txt)
+            MAX_ELAPSED=$(awk -F'|' 'BEGIN {max=0} {if($6>max) max=$6} END {print max}' task_stats.txt)
+            
+            echo "   Tasks completed: $TASK_COUNT" >> final-report.txt
+            echo "   Total requests: $(printf "%'d" $TOTAL_PROCESSED)" >> final-report.txt
+            WIDGETS_COUNT=$(wc -l < all-successful-widgets.txt | tr -d ' ')
+            echo "   Widgets found: $WIDGETS_COUNT" >> final-report.txt
+            echo "   JSON files: $(find all-results -name "GR-C-Categ-*.json" | wc -l)" >> final-report.txt
+            echo "   Max runtime: $((MAX_ELAPSED/3600))h $((MAX_ELAPSED%3600/60))m $((MAX_ELAPSED%60))s" >> final-report.txt
+            
+            if [ "$TOTAL_PROCESSED" -gt "0" ]; then
+              SUCCESS_RATE=$(awk "BEGIN {printf \"%.6f\", ($TOTAL_FOUND / $TOTAL_PROCESSED) * 100}")
+              echo "   Success rate: $SUCCESS_RATE%" >> final-report.txt
+            fi
+          fi
+          
+          echo "" >> final-report.txt
+          echo "═══════════════ TASK BREAKDOWN ═══════════════" >> final-report.txt
+          
+          if [ -f task_stats.txt ]; then
+            echo "" >> final-report.txt
+            printf "%-10s %-10s %-10s %12s %8s %10s\n" "Start" "End" "Last" "Processed" "Found" "Runtime" >> final-report.txt
+            echo "────────────────────────────────────────────────────────────────" >> final-report.txt
+            
+            while IFS='|' read -r start end last processed found elapsed; do
+              runtime="${elapsed}s"
+              if [ "$elapsed" -ge 3600 ]; then
+                runtime="$((elapsed/3600))h$((elapsed%3600/60))m"
+              elif [ "$elapsed" -ge 60 ]; then
+                runtime="$((elapsed/60))m$((elapsed%60))s"
+              fi
+              printf "%-10s %-10s %-10s %12s %8s %10s\n" "$start" "$end" "$last" "$processed" "$found" "$runtime" >> final-report.txt
+            done < task_stats.txt
+          fi
+          
+          echo "" >> final-report.txt
+          echo "✅ All Successful Widgets:" >> final-report.txt
+          echo "" >> final-report.txt
+          
+          TOTAL_WIDGETS=$(wc -l < all-successful-widgets.txt | tr -d ' ')
+          if [ "$TOTAL_WIDGETS" -gt "0" ]; then
+            cat all-successful-widgets.txt | nl -w3 -s'. ' | sed 's/^/   /' >> final-report.txt
+          else
+            echo "   (none found)" >> final-report.txt
+          fi
+          
+          echo "" >> final-report.txt
+          echo "═══════════════════════════════════════════════════════════" >> final-report.txt
+          
+          # 显示报告
+          echo ""
+          cat final-report.txt
+          
+      - name: Create merged archive
+        run: |
+          echo "Creating compressed archive..."
+          tar -czf category-data-complete.tar.gz all-results/
+          echo "✅ Archive created: category-data-complete.tar.gz"
+          echo "   Size: $(du -h category-data-complete.tar.gz | cut -f1)"
+          
+      - name: Upload widget list
+        uses: actions/upload-artifact@v4
+        with:
+          name: successful-widgets-list
+          path: |
+            all-successful-widgets.txt
+            final-report.txt
+            task_stats.txt
+          retention-days: 90
+
+      - name: Upload merged results
+        uses: actions/upload-artifact@v4
+        with:
+          name: category-data-complete
+          path: category-data-complete.tar.gz
+          retention-days: 90
+
+      - name: Final Summary
+        run: |
+          TOTAL_FILES=$(find all-results -name "GR-C-Categ-*.json" 2>/dev/null | wc -l | tr -d ' ')
+          TOTAL_WIDGETS=$(wc -l < all-successful-widgets.txt 2>/dev/null | tr -d ' ' || echo "0")
+          
+          echo "## 🎉 Scan Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Overall Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 配置信息
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Range: \`${{ github.event.inputs.start_hex }}\` → \`${{ github.event.inputs.end_hex }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Parallel tasks: **${{ github.event.inputs.splits }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Concurrency: **${{ github.event.inputs.concurrency }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 结果表格
+          echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📁 Total JSON files | **${TOTAL_FILES}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Unique widgets | **${TOTAL_WIDGETS}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Archive size | **$(du -h category-data-complete.tar.gz 2>/dev/null | cut -f1)** |" >> $GITHUB_STEP_SUMMARY
+          echo "| 💾 Data size | **$(du -sh all-results 2>/dev/null | cut -f1)** |" >> $GITHUB_STEP_SUMMARY
+          
+          # 添加统计信息
+          if [ -f task_stats.txt ]; then
+            TOTAL_PROCESSED=$(awk -F'|' '{sum+=$4} END {print sum}' task_stats.txt)
+            TOTAL_FOUND=$(awk -F'|' '{sum+=$5} END {print sum}' task_stats.txt)
+            
+            echo "| 📊 Total processed | **$(printf "%'d" $TOTAL_PROCESSED)** |" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$TOTAL_PROCESSED" -gt "0" ]; then
+              SUCCESS_RATE=$(awk "BEGIN {printf \"%.6f\", ($TOTAL_FOUND / $TOTAL_PROCESSED) * 100}")
+              echo "| 🎯 Success rate | **${SUCCESS_RATE}%** |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Widget 列表
+          if [ "$TOTAL_WIDGETS" -gt "0" ]; then
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>✅ All Successful Widgets (${TOTAL_WIDGETS} total) - Click to expand</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat all-successful-widgets.txt | nl -w3 -s'. ' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ℹ️ No Widgets Found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The specified range did not contain any valid category widgets." >> $GITHUB_STEP_SUMMARY
+            echo "Try a different range or check the API parameters." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 任务分解表格
+          if [ -f task_stats.txt ]; then
+            echo "### 📋 Task Breakdown" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Task | Range | Progress | Processed | Found | Runtime |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|-------|----------|-----------|-------|---------|" >> $GITHUB_STEP_SUMMARY
+            
+            TASK_NUM=1
+            while IFS='|' read -r start end last processed found elapsed; do
+              runtime="${elapsed}s"
+              if [ "$elapsed" -ge 3600 ]; then
+                runtime="$((elapsed/3600))h $((elapsed%3600/60))m"
+              elif [ "$elapsed" -ge 60 ]; then
+                runtime="$((elapsed/60))m $((elapsed%60))s"
+              fi
+              
+              # 计算进度
+              if [ ! -z "$start" ] && [ ! -z "$end" ] && [ ! -z "$last" ]; then
+                START_DEC=$((16#$start))
+                END_DEC=$((16#$end))
+                LAST_DEC=$((16#$last))
+                PROGRESS=$(awk "BEGIN {printf \"%.1f%%\", (($LAST_DEC - $START_DEC + 1) / ($END_DEC - $START_DEC + 1)) * 100}")
+              else
+                PROGRESS="N/A"
+              fi
+              
+              echo "| #$TASK_NUM | \`$start\`→\`$end\` | $PROGRESS | $processed | **$found** | $runtime |" >> $GITHUB_STEP_SUMMARY
+              TASK_NUM=$((TASK_NUM + 1))
+            done < task_stats.txt
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 下载说明
+          echo "### 📥 Download Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Available artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- **\`category-data-complete\`** - Complete archive of all JSON files" >> $GITHUB_STEP_SUMMARY
+          echo "- **\`successful-widgets-list\`** - Text files with widget IDs and statistics" >> $GITHUB_STEP_SUMMARY
+          echo "- **\`category-data-part-X\`** - Individual task outputs (for debugging)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 完整报告
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📊 Complete Detailed Report - Click to expand</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat final-report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
