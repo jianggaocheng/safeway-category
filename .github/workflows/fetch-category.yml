@@ -356,12 +356,10 @@ jobs:
           
       - name: Create detailed report
         run: |
-          # 创建详细汇总报告          cat > final-report.txt << 'EOF'
-          ╔════════════════════════════════════════════════════════╗
-          ║         COMPLETE SCAN SUMMARY REPORT                   ║
-          ╚════════════════════════════════════════════════════════╝
-          EOF
-          
+          # 创建详细汇总报告
+          echo "╔════════════════════════════════════════════════════════╗" > final-report.txt
+          echo "║         COMPLETE SCAN SUMMARY REPORT                   ║" >> final-report.txt
+          echo "╚════════════════════════════════════════════════════════╝" >> final-report.txt
           echo "" >> final-report.txt
           echo "📊 Overall Statistics:" >> final-report.txt
           echo "   Configuration: ${{ github.event.inputs.start_hex }} → ${{ github.event.inputs.end_hex }}" >> final-report.txt
