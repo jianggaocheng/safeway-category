@@ -1,0 +1,393 @@
+name: Scheduled Auto Scan
+
+on:
+  # 每 6 小时自动运行一次
+  schedule:
+    - cron: '0 */6 * * *'  # 每天 0:00, 6:00, 12:00, 18:00 UTC 运行
+  
+  # 也支持手动触发
+  workflow_dispatch:
+    inputs:
+      reset_progress:
+        description: '重置进度，从头开始'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      batch_size:
+        description: '每批次处理的范围大小 (hex)'
+        required: true
+        default: '03000000'
+      concurrency:
+        description: '并发数'
+        required: true
+        default: '50'
+
+jobs:
+  check-and-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5.8 小时
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史以访问之前的 artifacts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Download previous progress
+        id: download_progress
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            
+            // 获取最近的 workflow runs
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'scheduled-scan.yml',
+              per_page: 20,
+              status: 'completed'
+            });
+            
+            console.log(`Found ${runs.data.workflow_runs.length} completed runs`);
+            
+            // 查找最近的成功运行的 progress artifact
+            for (const run of runs.data.workflow_runs) {
+              try {
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id,
+                });
+                
+                const progressArtifact = artifacts.data.artifacts.find(a => a.name === 'scan-progress');
+                
+                if (progressArtifact) {
+                  console.log(`Found progress artifact in run ${run.id}`);
+                  
+                  // 下载 artifact
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: progressArtifact.id,
+                    archive_format: 'zip',
+                  });
+                  
+                  // 保存到文件
+                  fs.writeFileSync('progress.zip', Buffer.from(download.data));
+                  console.log('Progress artifact downloaded');
+                  core.setOutput('found', 'true');
+                  return;
+                }
+              } catch (error) {
+                console.log(`Error checking run ${run.id}: ${error.message}`);
+              }
+            }
+            
+            console.log('No previous progress found');
+            core.setOutput('found', 'false');
+
+      - name: Extract progress
+        if: steps.download_progress.outputs.found == 'true'
+        run: |
+          if [ -f progress.zip ]; then
+            unzip -q progress.zip || true
+            if [ -f progress.json ]; then
+              echo "✅ Previous progress restored:"
+              cat progress.json
+            fi
+          fi
+
+      - name: Determine current range
+        id: calc_range
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          
+          const TOTAL_MAX = 'ffffffff';
+          const batchSizeHex = process.env.BATCH_SIZE || '03000000';
+          const resetProgress = process.env.RESET_PROGRESS === 'true';
+          
+          let startHex = '00000000';
+          
+          // 如果不是重置，尝试从 progress.json 读取
+          if (!resetProgress && fs.existsSync('progress.json')) {
+            try {
+              const progress = JSON.parse(fs.readFileSync('progress.json', 'utf8'));
+              const lastProcessedHex = progress.lastProcessedHex || progress.next_start || '00000000';
+              const lastInt = parseInt(lastProcessedHex, 16);
+              startHex = (lastInt + 1).toString(16).padStart(8, '0');
+              console.log(`📍 Resuming from previous progress: ${lastProcessedHex} -> ${startHex}`);
+            } catch (e) {
+              console.log(`⚠️  Could not read progress, starting from beginning: ${e.message}`);
+            }
+          } else if (resetProgress) {
+            console.log('🔄 Progress reset requested, starting from beginning');
+          }
+          
+          const batchSize = parseInt(batchSizeHex, 16);
+          const startInt = parseInt(startHex, 16);
+          const maxInt = parseInt(TOTAL_MAX, 16);
+          
+          // 检查是否已经完成
+          if (startInt > maxInt) {
+            console.log('✅ All ranges completed!');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `is_complete=true\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `should_run=false\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `start_hex=ffffffff\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `end_hex=ffffffff\n`);
+            return;
+          }
+          
+          let endInt = startInt + batchSize - 1;
+          let isComplete = false;
+          
+          if (endInt >= maxInt) {
+            endInt = maxInt;
+            isComplete = true;
+          }
+          
+          const endHex = endInt.toString(16).padStart(8, '0');
+          const nextStartInt = endInt + 1;
+          const nextStartHex = nextStartInt > maxInt ? 'complete' : nextStartInt.toString(16).padStart(8, '0');
+          
+          // 计算总体进度
+          const totalRange = maxInt + 1;
+          const processedRange = endInt + 1;
+          const progressPercent = ((processedRange / totalRange) * 100).toFixed(2);
+          
+          console.log(`\n╔════════════════════════════════════════════════════════╗`);
+          console.log(`║           Current Batch Configuration                 ║`);
+          console.log(`╚════════════════════════════════════════════════════════╝`);
+          console.log(`Range:    ${startHex} -> ${endHex}`);
+          console.log(`Progress: ${progressPercent}%`);
+          console.log(`Next:     ${nextStartHex}`);
+          console.log(`Complete: ${isComplete}`);
+          console.log(``);
+          
+          // 输出到 GitHub Actions
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `start_hex=${startHex}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `end_hex=${endHex}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `next_start=${nextStartHex}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `is_complete=${isComplete}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `progress_percent=${progressPercent}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `should_run=true\n`);
+          EOF
+        env:
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '03000000' }}
+          RESET_PROGRESS: ${{ github.event.inputs.reset_progress || 'false' }}
+
+      - name: Check if should run
+        if: steps.calc_range.outputs.should_run != 'true'
+        run: |
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║           🎉 ALL SCANS COMPLETED! 🎉                   ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "All ranges from 00000000 to ffffffff have been processed!"
+          echo ""
+          
+          echo "## 🎉 All Scans Completed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The entire range (00000000 to ffffffff) has been scanned!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "You can disable the scheduled workflow now." >> $GITHUB_STEP_SUMMARY
+
+      - name: Install dependencies
+        if: steps.calc_range.outputs.should_run == 'true'
+        run: |
+          if [ -f package.json ]; then
+            npm install
+          else
+            npm install axios
+          fi
+
+      - name: Run scan
+        if: steps.calc_range.outputs.should_run == 'true'
+        run: |
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║           Starting Batch Scan                          ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "📍 Range: ${{ steps.calc_range.outputs.start_hex }} → ${{ steps.calc_range.outputs.end_hex }}"
+          echo "📊 Overall Progress: ${{ steps.calc_range.outputs.progress_percent }}%"
+          echo "⚡ Concurrency: ${{ github.event.inputs.concurrency || '50' }}"
+          echo "⏰ Max runtime: 5.8 hours"
+          echo "🔄 Next scheduled run: in ~6 hours"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          
+          # 启动后台进度监控
+          (
+            sleep 60
+            while true; do
+              if [ -f output/progress.json ]; then
+                echo ""
+                echo "╔═══════════════════ PROGRESS UPDATE ═══════════════════╗"
+                echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+                
+                LAST_HEX=$(grep -o '"lastProcessedHex":"[^"]*"' output/progress.json | cut -d'"' -f4 || echo "?")
+                PROCESSED=$(grep -o '"processedCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+                FOUND=$(grep -o '"foundCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+                RATE=$(grep -o '"avgRate":"[^"]*"' output/progress.json | cut -d'"' -f4 || echo "0")
+                ELAPSED=$(grep -o '"elapsedSeconds":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+                
+                echo "├─ Batch: ${{ steps.calc_range.outputs.start_hex }} → ${{ steps.calc_range.outputs.end_hex }}"
+                echo "├─ Current: $LAST_HEX"
+                echo "├─ Processed: $PROCESSED | Found: $FOUND"
+                echo "├─ Rate: $RATE req/s | Time: $((ELAPSED/3600))h $((ELAPSED%3600/60))m"
+                echo "├─ Overall: ${{ steps.calc_range.outputs.progress_percent }}%"
+                echo "╚══════════════════════════════════════════════════════╝"
+                echo ""
+              fi
+              sleep 300
+            done
+          ) &
+          MONITOR_PID=$!
+          
+          # 运行主任务
+          MAX_RUNTIME_SECONDS=20880 node fetch-category.js ${{ steps.calc_range.outputs.start_hex }} ${{ steps.calc_range.outputs.end_hex }} ${{ github.event.inputs.concurrency || '50' }}
+          EXIT_CODE=$?
+          
+          # 停止监控
+          kill $MONITOR_PID 2>/dev/null || true
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "✅ Batch completed with exit code: $EXIT_CODE"
+          
+          exit $EXIT_CODE
+
+      - name: Save progress for next run
+        if: always() && steps.calc_range.outputs.should_run == 'true'
+        run: |
+          # 创建进度文件
+          cat > progress.json << EOF
+          {
+            "next_start": "${{ steps.calc_range.outputs.next_start }}",
+            "last_batch_start": "${{ steps.calc_range.outputs.start_hex }}",
+            "last_batch_end": "${{ steps.calc_range.outputs.end_hex }}",
+            "progress_percent": "${{ steps.calc_range.outputs.progress_percent }}",
+            "is_complete": "${{ steps.calc_range.outputs.is_complete }}",
+            "last_run_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          
+          # 如果有实际的扫描进度，合并进来
+          if [ -f output/progress.json ]; then
+            node << 'MERGE_EOF'
+            const fs = require('fs');
+            const savedProgress = JSON.parse(fs.readFileSync('progress.json', 'utf8'));
+            const scanProgress = JSON.parse(fs.readFileSync('output/progress.json', 'utf8'));
+            
+            // 合并两个进度文件
+            const merged = {
+              ...savedProgress,
+              lastProcessedHex: scanProgress.lastProcessedHex,
+              scan_processed: scanProgress.processedCount,
+              scan_found: scanProgress.foundCount,
+              scan_elapsed: scanProgress.elapsedSeconds,
+              scan_avgRate: scanProgress.avgRate
+            };
+            
+            fs.writeFileSync('progress.json', JSON.stringify(merged, null, 2));
+            MERGE_EOF
+          fi
+          
+          echo "✅ Progress saved for next scheduled run"
+          cat progress.json
+
+      - name: Upload progress
+        if: always() && steps.calc_range.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-progress
+          path: progress.json
+          retention-days: 90
+
+      - name: Upload batch results
+        if: always() && steps.calc_range.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-${{ steps.calc_range.outputs.start_hex }}-to-${{ steps.calc_range.outputs.end_hex }}
+          path: output/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Generate summary
+        if: always() && steps.calc_range.outputs.should_run == 'true'
+        run: |
+          echo "## 📊 Batch Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Current Batch" >> $GITHUB_STEP_SUMMARY
+          echo "- **Range:** \`${{ steps.calc_range.outputs.start_hex }}\` → \`${{ steps.calc_range.outputs.end_hex }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Overall Progress:** ${{ steps.calc_range.outputs.progress_percent }}%" >> $GITHUB_STEP_SUMMARY
+          echo "- **Next Start:** \`${{ steps.calc_range.outputs.next_start }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Complete:** ${{ steps.calc_range.outputs.is_complete }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f output/progress.json ]; then
+            PROCESSED=$(grep -o '"processedCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            FOUND=$(grep -o '"foundCount":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            RATE=$(grep -o '"avgRate":"[^"]*"' output/progress.json | cut -d'"' -f4 || echo "0")
+            ELAPSED=$(grep -o '"elapsedSeconds":[0-9]*' output/progress.json | grep -o '[0-9]*' || echo "0")
+            
+            echo "### This Batch Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 📊 Processed | **${PROCESSED}** |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Found | **${FOUND}** |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚡ Rate | ${RATE} req/s |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏱️  Runtime | $((ELAPSED/3600))h $((ELAPSED%3600/60))m $((ELAPSED%60))s |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$FOUND" -gt "0" ]; then
+              echo "<details>" >> $GITHUB_STEP_SUMMARY
+              echo "<summary>✅ Found Widgets (${FOUND})</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              grep -o '"GR-C-Categ-[^"]*"' output/progress.json | tr -d '"' | nl >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          if [ -f output/summary.txt ]; then
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>📄 Detailed Report</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat output/summary.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 进度条
+          PROGRESS=${{ steps.calc_range.outputs.progress_percent }}
+          PROGRESS_INT=${PROGRESS%.*}
+          FILLED=$((PROGRESS_INT / 2))
+          EMPTY=$((50 - FILLED))
+          
+          echo "### 📈 Overall Progress" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          printf "["
+          printf "%${FILLED}s" | tr ' ' '='
+          printf "%${EMPTY}s" | tr ' ' '-'
+          printf "] ${PROGRESS}%%\n"
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔄 **Next scheduled run:** in ~6 hours" >> $GITHUB_STEP_SUMMARY
+
