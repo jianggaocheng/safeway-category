@@ -35,10 +35,11 @@ const axiosInstance = axios.create({
 });
 
 async function fetchWidget(widgetId) {
+  const requestId = Math.floor(900 * Math.random() + 100).toString() + Date.now() + Math.floor(900 * Math.random() + 100).toString();
   const config = {
     method: 'get',
     maxBodyLength: Infinity,
-    url: `https://www.safeway.com/abs/pub/xapi/wcax/pathway/search?request-id=1201764933828443125&url=https://www.safeway.com&search-uid=&q=&rows=300&start=0&channel=instore&storeid=3132&sort=&widget-id=${widgetId}&dvid=web-4.1search&uuid=null&pgm=abs&includeOffer=true&banner=safeway`,
+    url: `https://www.safeway.com/abs/pub/xapi/wcax/pathway/search?request-id=${requestId}&url=https://www.safeway.com&search-uid=&q=&rows=300&start=0&channel=instore&storeid=3132&sort=&widget-id=${widgetId}&dvid=web-4.1search&uuid=null&pgm=abs&includeOffer=true&banner=safeway`,
     headers: { 
       'accept': 'application/json, text/plain, */*', 
       'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7', 
